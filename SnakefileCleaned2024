@@ -1,0 +1,195 @@
+#Created by Lilly on 10/20/2022
+#First ever RNASeq Snakemake file
+#threads: snakemake is running these jobs independently
+#Cleaned on 07/19/2024
+
+#files to load
+srr = ["SRR13091257",
+       "SRR13091258",
+       "SRR13091259",
+       "SRR13091260",
+       "SRR13091261",
+       "SRR13091262",
+       "SRR13091263",
+       "SRR13091264",
+       "SRR13091265"]
+
+#rules for all outputs
+rule all:
+    input: #What you want to be run, anything with {sample} must be expanded
+        expand("results/fastqc/{sample}_1_fastqc.html", sample=srr),
+        expand("results/fastqc/{sample}_2_fastqc.html", sample=srr),
+        expand("results/salmon/{sample}_salmon/quant.sf", sample=srr),
+        "star_index/genomeParameters.txt",
+        expand("results/star/{sample}Aligned.sortedByCoord.out.bam",sample=srr),
+        "results/featureCounts/featureCounts_output.txt",
+        #"salmon_index/versionInfo.json",
+        #"results/{sample}_salmon/quant.sf",
+
+
+#quality control step
+rule fastqc:
+    input:
+        "data/{sample}_{n}.fastq"
+    output:
+        htmlfile = "results/fastqc/{sample}_{n}_fastqc.html",
+        zipfile = "results/fastqc/{sample}_{n}_fastqc.zip"
+    log: "results/fastqc/logs/{sample}_{n}.txt"
+    threads: 6
+    shell:
+        #`dirname {}` will call the target file to be the folder
+        "fastqc \
+            -o `dirname {output.htmlfile}` \ 
+            -t {threads} {input} \
+            &> {log}"
+
+rule salmon:
+    """
+    Run the psuedo-aligner, Salmon, which quantifies the transcripts but does
+    NOT provide coordinates/genomic locations (STAR does this). You would run
+    Salmon in order to find read abundance.
+    """
+    input:
+       index = "salmon_index/versionInfo.json",
+       r1 = "data/{sample}_1.fastq",
+       r2 = "data/{sample}_2.fastq",
+    output:
+        "results/salmon/{sample}_salmon/quant.sf"
+    threads: 10
+    log: "results/salmon/logs/{sample}.txt"
+    shell:
+        "salmon quant \
+            -p {threads} \
+            -i `dirname {input.index}` \
+            -l A \
+            -1 {input.r1} \
+            -2 {input.r2} \
+            -o `dirname {output}` \
+            --seqBias \
+            --useVBOpt \
+            --validateMappings \
+            &> {log}"
+
+rule star:
+    """
+    Run the aligner, STAR, using the sample's fastq files and the STAR index.
+    The STAR aligner uses the star index, which has genome coordinates, to
+    provide location to where the reads are mapping to. It is a more
+    computational-expensive algorithm than the psuedo-aligner, Salmon.
+    Will output the aligned samples, sorted by their coordinates.
+    """
+    input:
+        index = "star_index/genomeParameters.txt",
+        r1 = "data/{sample}_1.fastq",
+        r2 = "data/{sample}_2.fastq",
+    output:
+        "results/star/{sample}Aligned.sortedByCoord.out.bam",
+    threads: 10
+    log: "results/star/logs/{sample}.txt"
+    shell:
+        "STAR --genomeDir `dirname {input.index}` \
+            --runThreadN {threads} \
+            --readFilesIn {input.r1} {input.r2} \
+            --outFileNamePrefix `dirname {output}`/{wildcards.sample} \
+            --outSAMtype BAM SortedByCoordinate \
+            --outSAMunmapped Within \
+            --outSAMattributes Standard \
+            &> {log}"
+
+#counts
+rule featureCounts:
+    """
+    Use featureCounts to quantify the aligned reads that were identified by the
+    STAR algorithm AND provide annotation (gene features) for those mapped
+    reads. STAR + featureCounts allows us to get (1) # of reads (2) location of
+    reads in the genome (3) what genes the reads lie within/near/around.
+    """
+    input:
+        bam = expand("results/star/{sample}Aligned.sortedByCoord.out.bam", sample = srr),
+        gtf = "references/zfish_annotation.gtf",
+    output:
+        "results/featureCounts/featureCounts_output.txt",
+    threads: 6
+    log: "results/featureCounts/logs/log.txt"
+    shell: "featureCounts \
+        -p -O \
+        -T {threads} \
+        -a {input.gtf} \
+        -o {output} {input.bam} \
+        &> {log}"
+
+rule get_transcriptome_fasta:
+    """
+    Get the zfish, danio rerio, transcripts. This will help when generating the
+    Salmon index.
+    """
+    output:
+        "references/zfish_transcript.fa"
+    shell:
+        "curl https://ftp.ensembl.org/pub/release-108/fasta/danio_rerio/cdna/Danio_rerio.GRCz11.cdna.all.fa.gz | gzip -d > {output}"
+
+rule get_genome_fasta:
+    """
+    Get the zfish, danio rerio, genome. This will help when generating the Salmon index.
+    """
+    output:
+        "references/zfish_genome.fa"
+    shell:
+        "curl https://ftp.ensembl.org/pub/release-108/fasta/danio_rerio/dna/Danio_rerio.GRCz11.dna_sm.primary_assembly.fa.gz | gzip -d > {output}"
+
+rule get_accession_srr:
+    """
+    Get the accessions based off of the NCBI SRR identifiers
+    """
+    output:
+        r1 = "data/{srr}_1.fastq",
+        r2 = "data/{srr}_2.fastq"
+    threads: 4
+    shell:
+        "fasterq-dump \
+            -t /lscratch/$SLURM_JOBID {wildcards.srr} \
+            -O `dirname {output.r1}` \
+            -e {threads} \
+            --split-3 -\
+            -skip-technical"
+
+rule get_annotation_gtf:
+    """
+    Get the annotation gtf for STAR aligner from the zfish (danio rerio) gtf
+    file
+    """
+    output:
+        "references/zfish_annotation.gtf"
+    shell:
+        "curl https://ftp.ensembl.org/pub/release-108/gtf/danio_rerio/Danio_rerio.GRCz11.108.gtf.gz | gzip -d > {output}"
+
+rule make_salmon_index:
+    """
+    Create the psuedo-aligner, Salmon, index using the zfish transcripts
+    """
+    input:
+        "references/zfish_transcript.fa"
+    output:
+        "salmon_index/versionInfo.json"
+    shell:
+        "salmon index \
+            -t {input} \
+            -i `dirname {output}`"
+
+rule star_indexer:
+    """
+    Run the aligner, STAR, using the zfish genome and the zfish annotations
+    """
+    input:
+        fasta = "references/zfish_genome.fa",
+        gtf = "references/zfish_annotation.gtf"
+    output:
+        "star_index/genomeParameters.txt"
+    threads: 6
+    shell:
+        "STAR \
+            --runThreadN {threads} \
+            --runMode genomeGenerate \
+            --genomeDir `dirname {output}` \
+            --genomeFastaFiles {input.fasta} \
+            --sjdbGTFfile {input.gtf}"
